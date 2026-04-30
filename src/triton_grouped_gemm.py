@@ -38,7 +38,7 @@ def _gemm_tile(
     a_ptr,
     b_ptr,
     c_ptr,
-    expert_offsets_ptr,
+    expert_offsets_ptr,     # [Num_experts+1]，前缀和偏移，表示每个expert在 a_cat/c_cat 中的行区间
     expert_id,
     tile_m,
     tile_n,
@@ -59,12 +59,13 @@ def _gemm_tile(
     """One output tile for one expert."""
     expert_m_start = tl.load(expert_offsets_ptr + expert_id).to(tl.int32)
     expert_m_end = tl.load(expert_offsets_ptr + expert_id + 1).to(tl.int32)
-    expert_m = expert_m_end - expert_m_start
+    expert_m = expert_m_end - expert_m_start      # 当前专家在拼接矩阵中占多少行
 
-    offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
+    offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)    # 当前tile在M维覆盖哪些行
+    offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)    # 当前tile在N维覆盖哪些列
+    offs_k = tl.arange(0, BLOCK_K)    #  K方向索引
 
+    # 构造 A 子块 （BLOCK_M, BLOCK_N）的每个元素的地址矩阵
     a_ptrs = a_ptr + (expert_m_start + offs_m[:, None]) * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = (
         b_ptr
@@ -152,16 +153,16 @@ def _persistent_grouped_gemm_kernel_striped(
 
 @triton.jit
 def _persistent_grouped_gemm_kernel_atomic(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    work_expert_ptr,
-    work_tile_m_ptr,
-    work_tile_n_ptr,
-    expert_offsets_ptr,
-    num_work_items,
-    k_size,
-    n_size,
+    a_ptr,                   # a_cat, [M, K] 输入指针
+    b_ptr,                   # b_expert, [E, K, N] 专家权重指针
+    c_ptr,                   # c_cat, [M, N] 输出指针
+    work_expert_ptr,         # 任务队列指针，[num_work]，每个元素是expert_id
+    work_tile_m_ptr,         # 任务队列指针，[num_work]，每个元素是tile_m，即输出矩阵在M维度的tile编号
+    work_tile_n_ptr,         # 任务队列指针，[num_work]，每个元素是tile_n，即输出矩阵在N维度的tile编号
+    expert_offsets_ptr,      # 专家偏移量指针, [E+1],前缀和偏移
+    num_work_items,          # 总任务数，也就是线性任务队列的长度
+    k_size,             # GEMM 的K维大小
+    n_size,             # GEMM 的输出列数，也就是b_expert的N维度大小
     stride_am,
     stride_ak,
     stride_be,
@@ -169,13 +170,13 @@ def _persistent_grouped_gemm_kernel_atomic(
     stride_bn,
     stride_cm,
     stride_cn,
-    counter_ptr,
-    NUM_THREADS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    counter_ptr,                   # 全局原子计数器指针，用于动态取任务
+    NUM_THREADS: tl.constexpr,     # 每个block中的线程数，也就是warp数 * 每个warp中的线程数
+    BLOCK_M: tl.constexpr,         # tile 的M维大小
+    BLOCK_N: tl.constexpr,         # tile 的N维大小
+    BLOCK_K: tl.constexpr,         # tile 的K维大小
     IS_BF16: tl.constexpr,
-    MAX_ITERS: tl.constexpr,
+    MAX_ITERS: tl.constexpr,       # 最大迭代次数，用于防止死循环
 ):
     """
     Persistent workers dequeue tile indices with a global atomic (fetch-add).
@@ -186,27 +187,27 @@ def _persistent_grouped_gemm_kernel_atomic(
     Uses a dynamic `while` instead of `tl.static_range(MAX_ITERS)` so large
     `num_work` does not compile thousands of unrolled copies of this body.
     """
-    tid = tl.arange(0, NUM_THREADS)
-    leader = tid == 0
+    tid = tl.arange(0, NUM_THREADS)     # [NUM_THREADS]数组，生成一个从 0 到 NUM_THREADS-1 的整数数组
+    leader = tid == 0     # 布尔数组，[NUM_THREADS],true表示0号线程
     # Scalar global counter as a per-lane pointer block (same address, offset 0).
     zero_off = tl.zeros((NUM_THREADS,), tl.int32)
-    counter_addrs = counter_ptr + zero_off
-    cont = tl.full((), 1, tl.int32)
-    guard = tl.full((), 0, tl.int32)
+    counter_addrs = counter_ptr + zero_off   # [NUM_THREADS]数组，初始化warp内每个线程的计数器地址，为了后面的mask，只让0号线程执行原子操作
+    cont = tl.full((), 1, tl.int32)     # 标量，初始化为 1
+    guard = tl.full((), 0, tl.int32)    # 标量，初始化为 0
     while cont != 0:
-        inc = tl.where(leader, tl.full((NUM_THREADS,), 1, tl.int32), tl.zeros((NUM_THREADS,), tl.int32))
-        raw = tl.atomic_add(counter_addrs, inc, mask=leader, sem="relaxed")
-        work_id = tl.sum(tl.where(leader, raw.to(tl.int32), tl.zeros((NUM_THREADS,), tl.int32)))
-        sentinel = work_id >= num_work_items
+        inc = tl.where(leader, tl.full((NUM_THREADS,), 1, tl.int32), tl.zeros((NUM_THREADS,), tl.int32))  # 把 leader 数组从布尔数组变成 0、1 数组
+        raw = tl.atomic_add(counter_addrs, inc, mask=leader, sem="relaxed")    #  原子操作，计数器地址相同，+1返回旧值
+        work_id = tl.sum(tl.where(leader, raw.to(tl.int32), tl.zeros((NUM_THREADS,), tl.int32)))  # 把raw数组（比如[7, 0, 0, 0]）变成标量 work_id = 7
+        sentinel = work_id >= num_work_items     # 布尔标量，看当前任务计数器是否已经超过总任务数
         if work_id < num_work_items:
-            expert_id = tl.load(work_expert_ptr + work_id).to(tl.int32)
-            tile_m = tl.load(work_tile_m_ptr + work_id).to(tl.int32)
-            tile_n = tl.load(work_tile_n_ptr + work_id).to(tl.int32)
-            _gemm_tile(
+            expert_id = tl.load(work_expert_ptr + work_id).to(tl.int32)  # 读出这个任务属于哪个expert
+            tile_m = tl.load(work_tile_m_ptr + work_id).to(tl.int32)  # 这个任务的输出矩阵在M维方向的tile索引
+            tile_n = tl.load(work_tile_n_ptr + work_id).to(tl.int32)  # 这个任务的输出矩阵在N维方向的tile索引
+            _gemm_tile(          #  执行一个tile的GEMM，并把结果写回到c_ptr, 只算一个(BLOCK_M, BLOCK_N)的小块
                 a_ptr,
                 b_ptr,
                 c_ptr,
-                expert_offsets_ptr,
+                expert_offsets_ptr, 
                 expert_id,
                 tile_m,
                 tile_n,
@@ -224,31 +225,33 @@ def _persistent_grouped_gemm_kernel_atomic(
                 BLOCK_K,
                 IS_BF16,
             )
-        guard = guard + 1
-        exit_now = sentinel.logical_or(guard >= MAX_ITERS)
-        cont = tl.where(exit_now, tl.full((), 0, tl.int32), tl.full((), 1, tl.int32))
+        guard = guard + 1     # 迭代计数器 +1， 记录已经循环多少次
+        exit_now = sentinel.logical_or(guard >= MAX_ITERS)   # 满足任意条件就退出循环： (1)work_id >= num_work_items 任务取完 (2) guard >= MAX_ITER 循环次数达到上限
+        cont = tl.where(exit_now, tl.full((), 0, tl.int32), tl.full((), 1, tl.int32))  # 要退出： cont = 0； 继续循环: cont = 1
 
 
+# 把每个 expert 矩阵乘 拆成一堆 tile 任务，组成一个线性任务队列，用于后续调度
 def _build_work_queue(
-    expert_offsets: torch.Tensor,
-    n_size: int,
-    block_m: int,
-    block_n: int,
+    expert_offsets: torch.Tensor,    # 专家编号偏移量[E+1]，表示每个expert在 a_cat 中的行区间
+    n_size: int,                     # 输出矩阵的 N 维度大小
+    block_m: int,                    # tile 的 M 维大小
+    block_n: int,                    # tile 的 N 维大小
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert expert_offsets.dim() == 1
     num_experts = expert_offsets.numel() - 1
     work_expert = []
     work_tile_m = []
     work_tile_n = []
-    for expert_id in range(num_experts):
+    for expert_id in range(num_experts):   # 遍历每个 expert, 都拆成tile任务
+        #  当前专家的token数, 输出矩阵的 M 维度大小
         m_size = int((expert_offsets[expert_id + 1] - expert_offsets[expert_id]).item())
         if m_size <= 0:
             continue
-        tiles_m = (m_size + block_m - 1) // block_m
-        tiles_n = (n_size + block_n - 1) // block_n
+        tiles_m = (m_size + block_m - 1) // block_m   # 当前专家的token数，能拆成多少个 tile_m
+        tiles_n = (n_size + block_n - 1) // block_n   # 当前专家的token数，能拆成多少个 tile_n
         for tm in range(tiles_m):
             for tn in range(tiles_n):
-                work_expert.append(expert_id)
+                work_expert.append(expert_id)   # 
                 work_tile_m.append(tm)
                 work_tile_n.append(tn)
     device = expert_offsets.device
@@ -286,15 +289,15 @@ def expert_offsets_from_recv_counts(
 
 
 def persistent_grouped_gemm(
-    a_cat: torch.Tensor,
-    b_expert: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    num_sms: int = 24,
-    block_m: int = 128,
-    block_n: int = 128,
-    block_k: int = 32,
-    use_atomic_queue: bool = False,
-    work_counter: Optional[torch.Tensor] = None,
+    a_cat: torch.Tensor,               # [M, K] 输入矩阵A，各个expert的token按expert顺序拼接后的矩阵
+    b_expert: torch.Tensor,            # [E, K, N] 权重矩阵B，表示每个expert一套 K*N 的权重
+    expert_offsets: torch.Tensor,      # [E+1]前缀和偏移，表示每个expert在 a_cat 中的行区间
+    num_sms: int = 24,                 # 持久化 worker 数(kernel grid size)
+    block_m: int = 128,                # tile 的 M 维大小
+    block_n: int = 128,                # tile 的 N 维大小
+    block_k: int = 32,                 # tile 的 K 维分块步长
+    use_atomic_queue: bool = False,    # 是否启用原子全局队列“动态取任务”
+    work_counter: Optional[torch.Tensor] = None,    # 原子计数器，是任务队列的取号器，在 use_atomic_queue = True时，每个block都会做一次 atomic_ass(counter, 1), 拿到唯一的work_id，去处理对应的 tile
 ) -> torch.Tensor:
     """
     Compute grouped GEMM with persistent workers (striped or atomic dequeue).
@@ -331,11 +334,11 @@ def persistent_grouped_gemm(
         return c_cat
 
     is_bf16 = a_cat.dtype == torch.bfloat16
-    num_warps = 8
+    num_warps = 8                      #  8个warp，每个warp有32个线程
     num_threads = num_warps * 32
     grid = (num_sms,)
     expert_off_i32 = expert_offsets.to(torch.int32)
-    num_work = work_expert.numel()
+    num_work = work_expert.numel()     # 总任务数，也就是线性任务队列的长度
 
     if use_atomic_queue:
         if work_counter is None:
@@ -345,7 +348,7 @@ def persistent_grouped_gemm(
                 raise ValueError("work_counter must be int32 tensor of shape [1].")
             work_counter = work_counter.to(a_cat.device)
         work_counter.zero_()
-        # Each CTA may dequeue many tiles; upper bound per CTA <= total tiles (+ slack).
+        # Each Block may dequeue many tiles; upper bound per Block <= total tiles (+ slack).
         max_iters = min(65536, int(num_work) + int(num_sms) + 32)
         _persistent_grouped_gemm_kernel_atomic[grid](
             a_cat,

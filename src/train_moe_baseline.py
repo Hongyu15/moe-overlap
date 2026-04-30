@@ -15,18 +15,17 @@ from deep_ep_comm import DeepEPDispatcher
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MoE baseline with synthetic data.")
     parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--hidden-size", type=int, default=1024)
-    parser.add_argument("--ffn-multiplier", type=int, default=4)
-    parser.add_argument("--num-experts", type=int, default=8)
-    parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4)        #  每卡的 batch size (本地：1~4； A100: 8~32， 看显存)
+    parser.add_argument("--seq-len", type=int, default=4096),
+    parser.add_argument("--ffn-multiplier", type=int, default=4)    #  FFN 的维度放大倍数 (本地: 2~4; A100: 4)
+    parser.add_argument("--num-experts", type=int, default=16)      #  专家数量 (本地: NAN; A100: 64)
+    parser.add_argument("--top-k", type=int, default=2)             #  每个样本选择多少个专家 (本地: 2; A100: 2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--use-deepep", action="store_true")
-    parser.add_argument("--deepep-num-sms", type=int, default=24)
+    parser.add_argument("--use-deepep", action="store_true")        #  使用 DeepEP 作为通信后端 (本地: False; A100: True)
+    parser.add_argument("--deepep-num-sms", type=int, default=16)   #  DeepEP 使用的 SM 数量 (A100: 24)
     return parser.parse_args()
 
 
@@ -65,13 +64,13 @@ class ExpertMLP(nn.Module):
 
 
 @dataclass
-class RouterStats:
-    entropy: float
-    load_std: float
-    load_cv: float
+class RouterStats:       # 路由统计信息的数据结构，用于把moe的路由统计指标打包返回
+    entropy: float          # (1) 路由分布熵
+    load_std: float         # (2) 各expert负载的标准差
+    load_cv: float          # (3) 负载变异系数 (std / mean)，衡量不均衡程度
 
 
-class SimpleMoE(nn.Module):
+class SimpleMoE(nn.Module):   # 简化版 MoE 模型，包含路由、专家计算、通信后端和overlap配置
     def __init__(
         self,
         hidden_size: int,
@@ -80,21 +79,21 @@ class SimpleMoE(nn.Module):
         top_k: int,
         ep_group: dist.ProcessGroup | None = None,
         use_deepep: bool = False,
-        deepep_num_sms: int = 24,
+        deepep_num_sms: int = 24,    # 影响 DeepEP 侧用多少 SM 做通信相关 Kernel
     ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.router = nn.Linear(hidden_size, num_experts, bias=False)
+        self.router = nn.Linear(hidden_size, num_experts, bias=False)   # 路由层，将输入token映射到专家索引
         self.experts = nn.ModuleList(
-            [ExpertMLP(hidden_size, ffn_size) for _ in range(num_experts)]
+            [ExpertMLP(hidden_size, ffn_size) for _ in range(num_experts)]   # 专家列表，每个专家是一个 MLP 层
         )
         self.ep_group = ep_group
-        self.dispatcher = None
+        self.dispatcher = None   # 通信后端，None表示使用 baseline dispatcher；True 时会构建 DeepEPDispatcher
         if use_deepep:
             if ep_group is None:
                 raise ValueError("--use-deepep requires distributed execution with torchrun.")
-            self.dispatcher = DeepEPDispatcher(
+            self.dispatcher = DeepEPDispatcher(  # 构建 DeepEPDispatcher，用于分布式通信
                 group=ep_group,
                 hidden_size=hidden_size,
                 num_experts=num_experts,
@@ -106,10 +105,10 @@ class SimpleMoE(nn.Module):
         probs = F.softmax(logits, dim=-1)
         topk_prob, topk_idx = torch.topk(probs, k=self.top_k, dim=-1)
 
-        out = torch.zeros_like(x)
-        token_count = torch.zeros(self.num_experts, device=x.device, dtype=torch.float32)
+        out = torch.zeros_like(x)    #  初始化最终输出缓冲区，用于累加每个expert的输出
+        token_count = torch.zeros(self.num_experts, device=x.device, dtype=torch.float32)  #  初始化每个expert的token计数器
 
-        if self.dispatcher is None:
+        if self.dispatcher is None:   #  没有使用 DeepEP，使用 baseline dispatcher，显式索引路由，易于调试
             # Baseline dispatcher: explicit index routing, easy to instrument.
             for k in range(self.top_k):
                 expert_ids = topk_idx[:, k]
@@ -122,7 +121,7 @@ class SimpleMoE(nn.Module):
                     token_count[expert_id] += n
                     y = self.experts[expert_id](x[mask])
                     out[mask] += y * gate[mask].unsqueeze(-1)
-        else:
+        else:    #  deepEP 通信后端
             dispatch = self.dispatcher.dispatch(
                 x=x,
                 topk_idx=topk_idx.to(torch.int64),
