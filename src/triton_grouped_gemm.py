@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -15,10 +15,10 @@ except ImportError as exc:  # pragma: no cover
 """
 Grouped GEMM for MoE expert compute (A_i @ B_i), with two scheduling modes:
 
-1) **Striped persistent** (default): `num_sms` blocks stride over a pre-built work list
+1) **Striped persistent**: `num_sms` blocks stride over a pre-built work list
    (`work_id += num_workers`). Same total work as atomic mode, easier to reason about.
 
-2) **Atomic work queue** (`use_atomic_queue=True`): all blocks compete for the next tile
+2) **Atomic work queue** (default, `use_atomic_queue=True`): all blocks compete for the next tile
    index via `atomic_add` on a device counter. This is the common GPU pattern for
    **dynamic load balance** (often loosely called "work stealing" in papers; strictly
    it is **global task dequeue**, not thief-side stealing from peer queues).
@@ -296,7 +296,7 @@ def persistent_grouped_gemm(
     block_m: int = 128,                # tile 的 M 维大小
     block_n: int = 128,                # tile 的 N 维大小
     block_k: int = 32,                 # tile 的 K 维分块步长
-    use_atomic_queue: bool = False,    # 是否启用原子全局队列“动态取任务”
+    use_atomic_queue: bool = True,    # 是否启用原子全局队列“动态取任务”（默认开启）
     work_counter: Optional[torch.Tensor] = None,    # 原子计数器，是任务队列的取号器，在 use_atomic_queue = True时，每个block都会做一次 atomic_ass(counter, 1), 拿到唯一的work_id，去处理对应的 tile
 ) -> torch.Tensor:
     """

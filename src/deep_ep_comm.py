@@ -13,13 +13,13 @@ class DispatchResult:
     recv_x: torch.Tensor
     recv_topk_idx: torch.Tensor
     recv_topk_weights: torch.Tensor
-    handle: tuple
-    event: object
+    handle: tuple     # 通信句柄，用于后续的combine操作
+    event: object     # DeepEP返回的异步完成事件对象，用来做流同步/overlap
 
 
 class DeepEPDispatcher:
     """
-    Thin wrapper around DeepEP dispatch/combine APIs for intranode experiments.
+    Thin wrapper around DeepEP dispatch/combine APIs for intranode communication.
     """
 
     def __init__(self, group: dist.ProcessGroup, hidden_size: int, num_experts: int, num_sms: int = 24):
