@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -49,16 +50,20 @@ class DeepEPDispatcher:
         return deep_ep
 
     def _build_buffer(self) -> None:
-        hidden_bytes = self.hidden_size * 2  # BF16
+        # Use a conservative NVL buffer estimate by default; tunable via env vars.
+        bytes_per_elem = int(os.environ.get("DEEPEP_HIDDEN_BYTES_PER_ELEM", "4"))
+        nvl_scale = float(os.environ.get("DEEPEP_NVL_BUFFER_SCALE", "2.0"))
+        min_nvl_bytes = int(os.environ.get("DEEPEP_NVL_BUFFER_MIN_BYTES", "0"))
+        hidden_bytes = self.hidden_size * max(1, bytes_per_elem)
         num_nvl_bytes = 0
         for cfg in (
             self._deep_ep.Buffer.get_dispatch_config(self.group.size()),
             self._deep_ep.Buffer.get_combine_config(self.group.size()),
         ):
-            num_nvl_bytes = max(
-                num_nvl_bytes,
-                int(cfg.get_nvl_buffer_size_hint(hidden_bytes, self.group.size())),
-            )
+            hint = int(cfg.get_nvl_buffer_size_hint(hidden_bytes, self.group.size()))
+            scaled = max(hint, int(hint * max(1.0, nvl_scale)))
+            num_nvl_bytes = max(num_nvl_bytes, scaled)
+        num_nvl_bytes = max(num_nvl_bytes, min_nvl_bytes)
         self._buffer = self._deep_ep.Buffer(self.group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=0)
 
     def dispatch(
