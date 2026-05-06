@@ -16,7 +16,7 @@ from triton_grouped_gemm import persistent_grouped_gemm
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MoE prefill baseline with synthetic data.")
-    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--hidden-size", type=int, default=7168)
     parser.add_argument("--batch-size", type=int, default=4)        #  每卡的 batch size (本地：1~4； A100: 8~32， 看显存)
     parser.add_argument("--seq-len", type=int, default=4096),       #  单卡总tokens数 = batch_size * seq_len
@@ -32,6 +32,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deepep-num-sms", type=int, default=16)   #  DeepEP 使用的 SM 数量 (A100: 16)
     parser.add_argument("--micro-batch-size", type=int, default=4096)
     parser.add_argument("--check-correctness", action="store_true")
+    parser.add_argument("--compare-deepep-kernels", action="store_true")
+    parser.add_argument("--enable-nvtx", action="store_true")
+    parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--ref-comm-backend", choices=["deepep", "torch_a2a"], default="torch_a2a")
     parser.add_argument("--ref-expert-kernel", choices=["torch", "triton"], default="torch")
     parser.add_argument("--check-atol", type=float, default=5e-2)
@@ -68,6 +71,18 @@ def set_seed(seed: int, rank: int) -> None:
     torch.cuda.manual_seed_all(seed + rank)
 
 
+@contextlib.contextmanager
+def nvtx_range(name: str, enabled: bool):
+    if enabled and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+
+
 class ExpertMLP(nn.Module):
     def __init__(self, hidden_size: int, ffn_size: int):
         super().__init__()
@@ -85,6 +100,15 @@ class RouterStats:       # 路由统计信息的数据结构，用于把moe的�
     load_cv: float          # (3) 负载变异系数 (std / mean)，衡量不均衡程度
 
 
+@dataclass
+class StepMetrics:
+    step_time_ms: float
+    step_tps: float
+    router_entropy: float
+    expert_load_std: float
+    expert_load_cv: float
+
+
 class SimpleMoE(nn.Module):   # 简化版 MoE 模型，包含路由、专家计算、通信后端和overlap配置
     def __init__(
         self,
@@ -98,6 +122,7 @@ class SimpleMoE(nn.Module):   # 简化版 MoE 模型，包含路由、专家计�
         deepep_num_sms: int = 16,    # 影响 DeepEP 侧用多少 SM 做通信相关 Kernel
         micro_batch_size: int = 4096,
         expert_kernel: str = "triton",
+        enable_nvtx: bool = False,
     ):
         super().__init__()
         self.ep_group = ep_group
@@ -122,6 +147,7 @@ class SimpleMoE(nn.Module):   # 简化版 MoE 模型，包含路由、专家计�
         )
         self.micro_batch_size = micro_batch_size
         self.expert_kernel = expert_kernel
+        self.enable_nvtx = enable_nvtx
         self.dispatcher = None
         if self.world_size > 1 and self.comm_backend not in ("deepep", "torch_a2a"):
             raise ValueError(f"Unsupported comm backend: {self.comm_backend}")
@@ -314,12 +340,13 @@ class SimpleMoE(nn.Module):   # 简化版 MoE 模型，包含路由、专家计�
                 # DeepEP intranode kernels expect low-precision activations for dispatch/combine.
                 if chunk_x.dtype not in (torch.bfloat16, torch.float16):
                     chunk_x = chunk_x.to(torch.bfloat16)
-                result = self.dispatcher.dispatch(       # 返回的是deep_ep_comm.py中的 DispatchResult 对象
-                    x=chunk_x,
-                    topk_idx=topk_idx[start:end].to(torch.int64),
-                    topk_weights=topk_prob[start:end].float(),     #  [chunk_size, routed_top_k]
-                    previous_event=previous_event,
-                )
+                with nvtx_range(f"deepep_dispatch_chunk_{chunk_idx}", self.enable_nvtx):
+                    result = self.dispatcher.dispatch(       # 返回的是deep_ep_comm.py中的 DispatchResult 对象
+                        x=chunk_x,
+                        topk_idx=topk_idx[start:end].to(torch.int64),
+                        topk_weights=topk_prob[start:end].float(),     #  [chunk_size, routed_top_k]
+                        previous_event=previous_event,
+                    )
                 return start, end, result
 
             # Warm start first chunk communication.
@@ -334,30 +361,32 @@ class SimpleMoE(nn.Module):   # 简化版 MoE 模型，包含路由、专家计�
 
                 stream_ctx = torch.cuda.stream(compute_stream) if compute_stream is not None else contextlib.nullcontext()
                 with stream_ctx:
-                    # Wait current chunk communication completion before consuming recv tensors on compute stream.
-                    current.event.current_stream_wait()
-                    recv_x = current.recv_x
-                    recv_topk_idx = current.recv_topk_idx
-                    recv_topk_weights = current.recv_topk_weights
+                    with nvtx_range(f"expert_compute_chunk_{chunk_idx}", self.enable_nvtx):
+                        # Wait current chunk communication completion before consuming recv tensors on compute stream.
+                        current.event.current_stream_wait()
+                        recv_x = current.recv_x
+                        recv_topk_idx = current.recv_topk_idx
+                        recv_topk_weights = current.recv_topk_weights
 
-                    recv_y = torch.zeros_like(recv_x)
-                    if recv_topk_idx.dim() == 2:
-                        for k in range(recv_topk_idx.size(1)):
-                            expert_ids = recv_topk_idx[:, k]
-                            gate = recv_topk_weights[:, k]
-                            y, counts = self._run_routed_experts(recv_x, expert_ids)
+                        recv_y = torch.zeros_like(recv_x)
+                        if recv_topk_idx.dim() == 2:
+                            for k in range(recv_topk_idx.size(1)):
+                                expert_ids = recv_topk_idx[:, k]
+                                gate = recv_topk_weights[:, k]
+                                y, counts = self._run_routed_experts(recv_x, expert_ids)
+                                local_token_count += counts
+                                recv_y += y * gate.unsqueeze(-1)
+                        else:
+                            y, counts = self._run_routed_experts(recv_x, recv_topk_idx)
                             local_token_count += counts
-                            recv_y += y * gate.unsqueeze(-1)
-                    else:
-                        y, counts = self._run_routed_experts(recv_x, recv_topk_idx)
-                        local_token_count += counts
-                        recv_y += y * recv_topk_weights.unsqueeze(-1)
+                            recv_y += y * recv_topk_weights.unsqueeze(-1)
 
-                    combined_chunk, combine_event = self.dispatcher.combine(
-                        recv_y,
-                        current.handle,
-                        previous_event=current.event,
-                    )
+                    with nvtx_range(f"deepep_combine_chunk_{chunk_idx}", self.enable_nvtx):
+                        combined_chunk, combine_event = self.dispatcher.combine(
+                            recv_y,
+                            current.handle,
+                            previous_event=current.event,
+                        )
 
                 # Retire previous combine result here so we do not block compute stream.
                 if pending_combine is not None:
@@ -412,6 +441,7 @@ class TinyMoEModel(nn.Module):
         deepep_num_sms: int = 24,
         micro_batch_size: int = 4096,
         expert_kernel: str = "triton",
+        enable_nvtx: bool = False,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size)
@@ -426,6 +456,7 @@ class TinyMoEModel(nn.Module):
             deepep_num_sms=deepep_num_sms,
             micro_batch_size=micro_batch_size,
             expert_kernel=expert_kernel,
+            enable_nvtx=enable_nvtx,
         )
         self.head = nn.Linear(hidden_size, hidden_size, bias=False)
 
@@ -464,6 +495,118 @@ def run_forward_once(
     return y, stats
 
 
+def measure_single_step(
+    model: nn.Module,
+    x: torch.Tensor,
+    use_amp: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+    world_size: int,
+    distributed: bool,
+    batch_size: int,
+    seq_len: int,
+) -> StepMetrics:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                _, stats = model(x)
+        else:
+            _, stats = model(x)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    dt = time.perf_counter() - t0
+    step_tokens = batch_size * seq_len * world_size
+    return StepMetrics(
+        step_time_ms=dt * 1000.0,
+        step_tps=step_tokens / max(dt, 1e-9),
+        router_entropy=reduce_mean(stats.entropy, device, distributed),
+        expert_load_std=reduce_mean(stats.load_std, device, distributed),
+        expert_load_cv=reduce_mean(stats.load_cv, device, distributed),
+    )
+
+
+def compare_deepep_kernels_once(
+    args: argparse.Namespace,
+    device: torch.device,
+    rank: int,
+    local_rank: int,
+    world_size: int,
+    distributed: bool,
+    ep_group: dist.ProcessGroup | None,
+    dtype: torch.dtype,
+    use_amp: bool,
+) -> None:
+    if args.comm_backend != "deepep":
+        raise ValueError("--compare-deepep-kernels requires --comm-backend deepep.")
+    x_dtype = torch.float32 if use_amp else dtype
+    x = synthetic_batch(args.batch_size, args.seq_len, args.hidden_size, device, x_dtype)
+    results: dict[str, StepMetrics] = {}
+
+    for kernel in ("torch", "triton"):
+        model = TinyMoEModel(
+            args.hidden_size,
+            args.ffn_size,
+            args.num_routed_experts,
+            args.num_shared_experts,
+            args.routed_top_k,
+            ep_group=ep_group,
+            comm_backend="deepep",
+            deepep_num_sms=args.deepep_num_sms,
+            micro_batch_size=args.micro_batch_size,
+            expert_kernel=kernel,
+            enable_nvtx=args.enable_nvtx,
+        ).to(device)
+        model.eval()
+        if distributed:
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+        for _ in range(max(0, args.warmup_steps)):
+            _ = run_forward_once(model, x, use_amp=use_amp, dtype=dtype)
+        results[kernel] = measure_single_step(
+            model=model,
+            x=x,
+            use_amp=use_amp,
+            dtype=dtype,
+            device=device,
+            world_size=world_size,
+            distributed=distributed,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+        )
+        if distributed:
+            dist.barrier()
+
+    if rank == 0:
+        torch_res = results["torch"]
+        triton_res = results["triton"]
+        print("deepep-kernel-compare: one measured step per kernel")
+        print(
+            "  deepep+torch: "
+            f"step_time_ms={torch_res.step_time_ms:.2f} "
+            f"step_tps={torch_res.step_tps:.1f} "
+            f"router_entropy={torch_res.router_entropy:.4f} "
+            f"expert_load_std={torch_res.expert_load_std:.2f} "
+            f"expert_load_cv={torch_res.expert_load_cv:.4f}"
+        )
+        print(
+            "  deepep+triton(persistent_grouped_gemm): "
+            f"step_time_ms={triton_res.step_time_ms:.2f} "
+            f"step_tps={triton_res.step_tps:.1f} "
+            f"router_entropy={triton_res.router_entropy:.4f} "
+            f"expert_load_std={triton_res.expert_load_std:.2f} "
+            f"expert_load_cv={triton_res.expert_load_cv:.4f}"
+        )
+        print(
+            "  compare: "
+            f"time_ratio(torch/triton)={torch_res.step_time_ms / max(triton_res.step_time_ms, 1e-9):.3f}x "
+            f"tps_ratio(triton/torch)={triton_res.step_tps / max(torch_res.step_tps, 1e-9):.3f}x "
+            f"time_delta_ms={torch_res.step_time_ms - triton_res.step_time_ms:.2f}"
+        )
+
+
 def run_correctness_check(
     args: argparse.Namespace,
     device: torch.device,
@@ -484,6 +627,7 @@ def run_correctness_check(
         deepep_num_sms=args.deepep_num_sms,
         micro_batch_size=args.micro_batch_size,
         expert_kernel=args.ref_expert_kernel,
+        enable_nvtx=args.enable_nvtx,
     ).to(device)
     model_test = TinyMoEModel(
         args.hidden_size,
@@ -496,6 +640,7 @@ def run_correctness_check(
         deepep_num_sms=args.deepep_num_sms,
         micro_batch_size=args.micro_batch_size,
         expert_kernel=args.expert_kernel,
+        enable_nvtx=args.enable_nvtx,
     ).to(device)
     model_test.load_state_dict(model_ref.state_dict())
     model_ref.eval()
@@ -594,6 +739,22 @@ def main() -> None:
             dist.destroy_process_group()
         return
 
+    if args.compare_deepep_kernels:
+        compare_deepep_kernels_once(
+            args=args,
+            device=device,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            distributed=distributed,
+            ep_group=ep_group,
+            dtype=dtype,
+            use_amp=use_amp,
+        )
+        if distributed:
+            dist.destroy_process_group()
+        return
+
     model = TinyMoEModel(
         args.hidden_size,
         ffn_size,
@@ -605,6 +766,7 @@ def main() -> None:
         deepep_num_sms=args.deepep_num_sms,
         micro_batch_size=args.micro_batch_size,
         expert_kernel=args.expert_kernel,
+        enable_nvtx=args.enable_nvtx,
     ).to(device)
     model.eval()               #  设置为评估模式，禁用 dropout 等训练相关的层
     if distributed:
@@ -617,10 +779,10 @@ def main() -> None:
             f"comm_backend={args.comm_backend}, amp={use_amp}, "
             f"routed_experts={args.num_routed_experts}, shared_experts={args.num_shared_experts}, "
             f"routed_top_k={args.routed_top_k}, micro_batch_size={args.micro_batch_size}, "
-            f"expert_kernel={args.expert_kernel}"
+            f"expert_kernel={args.expert_kernel}, nvtx={args.enable_nvtx}"
         )
 
-    warmup_steps = 20
+    warmup_steps = max(0, args.warmup_steps)
     if rank == 0:
         print(f"warmup: running {warmup_steps} steps (excluded from metrics)")
     for _ in range(warmup_steps):
