@@ -57,19 +57,22 @@ def _gemm_tile(
     IS_BF16: tl.constexpr,
 ):
     """One output tile for one expert."""
-    expert_m_start = tl.load(expert_offsets_ptr + expert_id).to(tl.int32)
-    expert_m_end = tl.load(expert_offsets_ptr + expert_id + 1).to(tl.int32)
+    # Use 64-bit index math for pointer offsets to avoid overflow on large expert
+    # tables (e.g. E=256, H=7168, F=2048 where expert_id * stride_be exceeds int32).
+    expert_id_i64 = expert_id.to(tl.int64)
+    expert_m_start = tl.load(expert_offsets_ptr + expert_id).to(tl.int64)
+    expert_m_end = tl.load(expert_offsets_ptr + expert_id + 1).to(tl.int64)
     expert_m = expert_m_end - expert_m_start      # 当前专家在拼接矩阵中占多少行
 
-    offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)    # 当前tile在M维覆盖哪些行
-    offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)    # 当前tile在N维覆盖哪些列
-    offs_k = tl.arange(0, BLOCK_K)    #  K方向索引
+    offs_m = (tile_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)    # 当前tile在M维覆盖哪些行
+    offs_n = (tile_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)    # 当前tile在N维覆盖哪些列
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int64)    #  K方向索引
 
     # 构造 A 子块 （BLOCK_M, BLOCK_N）的每个元素的地址矩阵
     a_ptrs = a_ptr + (expert_m_start + offs_m[:, None]) * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = (
         b_ptr
-        + expert_id * stride_be
+        + expert_id_i64 * stride_be
         + offs_k[:, None] * stride_bk
         + offs_n[None, :] * stride_bn
     )
