@@ -233,36 +233,68 @@ def _persistent_grouped_gemm_kernel_atomic(
         cont = tl.where(exit_now, tl.full((), 0, tl.int32), tl.full((), 1, tl.int32))  # 要退出： cont = 0； 继续循环: cont = 1
 
 
-# 把每个 expert 矩阵乘 拆成一堆 tile 任务，组成一个线性任务队列，用于后续调度
+_WORK_QUEUE_CACHE: dict = {}
+_WORK_QUEUE_CACHE_MAX = 32
+
+
 def _build_work_queue(
-    expert_offsets: torch.Tensor,    # 专家编号偏移量[E+1]，表示每个expert在 a_cat 中的行区间
-    n_size: int,                     # 输出矩阵的 N 维度大小
-    block_m: int,                    # tile 的 M 维大小
-    block_n: int,                    # tile 的 N 维大小
+    expert_offsets: torch.Tensor,
+    n_size: int,
+    block_m: int,
+    block_n: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build (expert_id, tile_m, tile_n) work queue on GPU without Python loops.
+
+    Cached by (offsets bytes, n_size, block_m, block_n).
+    """
     assert expert_offsets.dim() == 1
-    num_experts = expert_offsets.numel() - 1
-    work_expert = []
-    work_tile_m = []
-    work_tile_n = []
-    for expert_id in range(num_experts):   # 遍历每个 expert, 都拆成tile任务
-        #  当前专家的token数, 输出矩阵的 M 维度大小
-        m_size = int((expert_offsets[expert_id + 1] - expert_offsets[expert_id]).item())
-        if m_size <= 0:
-            continue
-        tiles_m = (m_size + block_m - 1) // block_m   # 当前专家的token数，能拆成多少个 tile_m
-        tiles_n = (n_size + block_n - 1) // block_n   # 当前专家的token数，能拆成多少个 tile_n
-        for tm in range(tiles_m):
-            for tn in range(tiles_n):
-                work_expert.append(expert_id)   # 
-                work_tile_m.append(tm)
-                work_tile_n.append(tn)
     device = expert_offsets.device
-    return (
-        torch.tensor(work_expert, device=device, dtype=torch.int32),
-        torch.tensor(work_tile_m, device=device, dtype=torch.int32),
-        torch.tensor(work_tile_n, device=device, dtype=torch.int32),
+
+    offsets_i64 = expert_offsets.to(torch.int64)
+    counts = (offsets_i64[1:] - offsets_i64[:-1]).clamp_min(0)
+
+    key = (
+        offsets_i64.detach().to("cpu").numpy().tobytes(),
+        int(n_size),
+        int(block_m),
+        int(block_n),
     )
+    cached = _WORK_QUEUE_CACHE.get(key)
+    if cached is not None:
+        we, wm, wn = cached
+        if we.device == device:
+            return we, wm, wn
+
+    tiles_m_per_expert = ((counts + block_m - 1) // block_m).to(torch.int64)
+    tiles_n = (n_size + block_n - 1) // block_n
+    tiles_per_expert = tiles_m_per_expert * tiles_n
+    total_work = int(tiles_per_expert.sum().item())
+
+    if total_work == 0:
+        empty = torch.zeros((0,), device=device, dtype=torch.int32)
+        result = (empty, empty.clone(), empty.clone())
+    else:
+        expert_ids = torch.arange(counts.numel(), device=device, dtype=torch.int64)
+        work_expert_i64 = torch.repeat_interleave(expert_ids, tiles_per_expert)
+
+        cum_tiles = torch.cumsum(tiles_per_expert, dim=0)
+        offsets_in_work = cum_tiles - tiles_per_expert
+        all_pos = torch.arange(total_work, device=device, dtype=torch.int64)
+        local_pos = all_pos - offsets_in_work[work_expert_i64]
+
+        work_tile_m_i64 = local_pos // tiles_n
+        work_tile_n_i64 = local_pos % tiles_n
+
+        result = (
+            work_expert_i64.to(torch.int32),
+            work_tile_m_i64.to(torch.int32),
+            work_tile_n_i64.to(torch.int32),
+        )
+
+    if len(_WORK_QUEUE_CACHE) >= _WORK_QUEUE_CACHE_MAX:
+        _WORK_QUEUE_CACHE.pop(next(iter(_WORK_QUEUE_CACHE)))
+    _WORK_QUEUE_CACHE[key] = result
+    return result
 
 
 def expert_offsets_from_recv_counts(
@@ -292,15 +324,17 @@ def expert_offsets_from_recv_counts(
 
 
 def persistent_grouped_gemm(
-    a_cat: torch.Tensor,               # [M, K] 输入矩阵A，各个expert的token按expert顺序拼接后的矩阵
-    b_expert: torch.Tensor,            # [E, K, N] 权重矩阵B，表示每个expert一套 K*N 的权重
-    expert_offsets: torch.Tensor,      # [E+1]前缀和偏移，表示每个expert在 a_cat 中的行区间
-    num_sms: int = 24,                 # 持久化 worker 数(kernel grid size)
-    block_m: int = 128,                # tile 的 M 维大小
-    block_n: int = 128,                # tile 的 N 维大小
-    block_k: int = 32,                 # tile 的 K 维分块步长
-    use_atomic_queue: bool = True,    # 是否启用原子全局队列“动态取任务”（默认开启）
-    work_counter: Optional[torch.Tensor] = None,    # 原子计数器，是任务队列的取号器，在 use_atomic_queue = True时，每个block都会做一次 atomic_ass(counter, 1), 拿到唯一的work_id，去处理对应的 tile
+    a_cat: torch.Tensor,
+    b_expert: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    num_sms: int = 24,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 32,
+    use_atomic_queue: bool = True,
+    work_counter: Optional[torch.Tensor] = None,
+    num_warps: int = 8,
+    num_stages: int = 3,
 ) -> torch.Tensor:
     """
     Compute grouped GEMM with persistent workers (striped or atomic dequeue).
@@ -337,7 +371,6 @@ def persistent_grouped_gemm(
         return c_cat
 
     is_bf16 = a_cat.dtype == torch.bfloat16
-    num_warps = 8                      #  8个warp，每个warp有32个线程
     num_threads = num_warps * 32
     grid = (num_sms,)
     expert_off_i32 = expert_offsets.to(torch.int32)
@@ -379,7 +412,7 @@ def persistent_grouped_gemm(
             IS_BF16=is_bf16,
             MAX_ITERS=max_iters,
             num_warps=num_warps,
-            num_stages=3,
+            num_stages=num_stages,
         )
     else:
         _persistent_grouped_gemm_kernel_striped[grid](
@@ -405,7 +438,7 @@ def persistent_grouped_gemm(
             BLOCK_K=block_k,
             IS_BF16=is_bf16,
             num_warps=num_warps,
-            num_stages=3,
+            num_stages=num_stages,
         )
     return c_cat
 

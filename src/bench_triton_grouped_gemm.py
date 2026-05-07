@@ -15,7 +15,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--hidden-size", type=int, default=7168)
     parser.add_argument("--ffn-size", type=int, default=2048)
-    parser.add_argument("--num-sms", type=int, default=24)
+    parser.add_argument("--num-sms", type=int, default=84)
+    parser.add_argument("--block-m", type=int, default=128)
+    parser.add_argument("--block-n", type=int, default=128)
+    parser.add_argument("--block-k", type=int, default=32)
+    parser.add_argument("--num-warps", type=int, default=8)
+    parser.add_argument("--num-stages", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=1)
     parser.add_argument("--test-mode", choices=["both", "triton", "torch"], default="both")
@@ -75,30 +80,34 @@ def main() -> None:
     triton_ms = None
     torch_ms = None
 
+    triton_kwargs = dict(
+        num_sms=args.num_sms,
+        use_atomic_queue=use_atomic,
+        block_m=args.block_m,
+        block_n=args.block_n,
+        block_k=args.block_k,
+        num_warps=args.num_warps,
+        num_stages=args.num_stages,
+    )
+
     with torch.no_grad():
         c_ref = None
         c_tri = None
         if run_torch:
             c_ref = reference_grouped_gemm(a, b, offsets)
         if run_triton:
-            c_tri = persistent_grouped_gemm(
-                a, b, offsets, num_sms=args.num_sms, use_atomic_queue=use_atomic
-            )
+            c_tri = persistent_grouped_gemm(a, b, offsets, **triton_kwargs)
         if run_torch and run_triton:
             max_diff = (c_ref.float() - c_tri.float()).abs().max().item()
             print(f"[check] mode={'atomic' if use_atomic else 'striped'} max_abs_diff={max_diff:.6f}")
 
     if run_triton:
         for _ in range(args.warmup):
-            _ = persistent_grouped_gemm(
-                a, b, offsets, num_sms=args.num_sms, use_atomic_queue=use_atomic
-            )
+            _ = persistent_grouped_gemm(a, b, offsets, **triton_kwargs)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(args.iters):
-            _ = persistent_grouped_gemm(
-                a, b, offsets, num_sms=args.num_sms, use_atomic_queue=use_atomic
-            )
+            _ = persistent_grouped_gemm(a, b, offsets, **triton_kwargs)
         torch.cuda.synchronize()
         triton_ms = (time.perf_counter() - t0) * 1000 / args.iters
 
